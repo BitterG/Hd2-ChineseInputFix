@@ -1,0 +1,15 @@
+{
+  "Version": 1,
+  "Guid": "8a01dc3d-e467-5774-af49-9b426c42f828",
+  "Name": "ChineseInputFix",
+  "Description": "Needs Bingus Shared Loader v15 or newer with addon support enabled. Nothing else is required: 'API 1' is the loader's own Lua API level (printed in BingusSharedLoader.log), not a separate mod.",
+  "Options": [
+    {
+      "Name": "ChineseInputFix",
+      "Description": "Needs Bingus Shared Loader v15 or newer with addon support enabled. Nothing else is required: 'API 1' is the loader's own Lua API level (printed in BingusSharedLoader.log), not a separate mod.",
+      "Include": [
+        "Addon"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dll
+*.obj
+*.o
+*.exp
+*.lib
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary test files
+test_*.lua
+*.tmp
+*.log
+!ChineseInputFix.log
+
+# Build archives & caches
+build/
+dist/
+work/
+*.zip
