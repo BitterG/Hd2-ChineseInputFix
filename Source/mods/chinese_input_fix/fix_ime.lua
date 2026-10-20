@@ -1,16 +1,24 @@
 -- HD2-Addon: mods/chinese_input_fix/fix_ime
--- Chinese Input Fix (In-Game Overlay Mode v3.11 - Universal IME & Perfect Proportions) for Helldivers 2
--- 1. Single-line proportion perfection: 48px height, -30 font height, tight vertical centering.
--- 2. Full Third-party IME Support (Sogou, Wechat IME, Baidu, QQ, Microsoft Pinyin, etc.):
---    - Uses ES_AUTOHSCROLL (clean single-line edit)
---    - Explicit ImmAssociateContext + ImmSetOpenStatus activation
---    - Processes thread-wide messages (hwnd=0 in PeekMessage) so IME floating UI receives input
--- 3. Ultra-sheer dark glass with Acrylic blur
--- 4. Silent Enter/Esc handling (Zero Windows Ding)
--- 5. Unified send/close pipeline
+-- Chinese Input Fix v3.15.1 — 全能中文输入 + 彩色/字号聊天气泡
+--
+-- v3.13 修复: 打开输入框时游戏卡死(移除了会死锁的 AttachThreadInput); 分类名改为 ASCII 优先;
+-- v3.14: 版本号与包名统一; 字号范围 10-99(另加开关);
+-- v3.15: 修复「偶发输入框字体变小」—— HFONT 句柄被 tonumber 截断, 现在按 64 位原样传并回读校验;
+-- v3.15.1: 菜单文案去掉全角引号与中间点(游戏字体缺字, 会显示成问号)
+--   1. 切屏(Alt-Tab)返回后保留已输入内容(不再被 clear 掉)
+--   2. 彩色/字号标记: <c=AARRGGBB> 与 <s=xx>, 由 CowboyBingus Mod Options Menu 配置
+--      (预置 红/橙/黄/绿/青/蓝/紫/白/黑 + 自定义 RGBA 滑块)
+--   3. 无菜单时回落到 ChineseInputFix.ini
+--
+-- 既有能力(已实机验证):
+--   - 游戏内浮动输入条(黑色毛玻璃 + 微软雅黑), 全输入法通用(微软/搜狗/微信/百度/QQ)
+--   - 零延迟线程级消息泵, 拦截 Enter/Esc 的 WM_CHAR 以消除 Windows "叮" 声
+--   - 空内容 / 非空内容走同一条 set_text + Enter 提交路径
+--   - Alt-Tab / 失焦 时静默隐藏, 不残留到其他窗口
+--   - 严格单行比例(960x48, 字号 -28)
 
 if rawget(_G, "__HD2_CHINESE_INPUT_OVERLAY_MOD") then
-    return { installed = true, version = "3.11.0" }
+    return { installed = true, version = "3.15.1" }
 end
 
 local ok_ffi, ffi = pcall(require, "ffi")
@@ -18,13 +26,18 @@ if not ok_ffi or not ffi or ffi.os ~= "Windows" or not ffi.abi("64bit") then
     return { installed = false, reason = "Windows x64 LuaJIT required" }
 end
 
+local MOD_VERSION = "3.15.1"
+local LOG_NAME = "ChineseInputFix"
+
 local M = {
-    version = "3.11.0",
+    version = MOD_VERSION,
     started = false,
     ready = false,
     retired = false,
     errors = 0,
-    was_chat_open = false,
+    frames = 0,
+    suspended = false,     -- 失焦挂起(保留输入内容)
+    last_status = nil,
     cooldown_until = 0,
     last_enter = false,
     last_esc = false,
@@ -94,6 +107,7 @@ local function init_native()
             ) __asm__("CreateWindowExW");
             BOOL hd2_DestroyWindow(HWND hWnd) __asm__("DestroyWindow");
             BOOL hd2_ShowWindow(HWND hWnd, int nCmdShow) __asm__("ShowWindow");
+            BOOL hd2_IsWindow(HWND hWnd) __asm__("IsWindow");
             BOOL hd2_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, uint32_t uFlags)
                 __asm__("SetWindowPos");
             BOOL hd2_SetForegroundWindow(HWND hWnd) __asm__("SetForegroundWindow");
@@ -285,11 +299,16 @@ local function resolve_sigs()
 end
 
 -- -------------------------------------------------------------------------------------
--- Logging
+-- Paths / Logging / Config
 -- -------------------------------------------------------------------------------------
-local function log_message(msg)
+local function data_dir()
     local dir = os.getenv("LOCALAPPDATA")
-    local path = dir and (dir .. "/CowboyBingus/Helldivers2/Logs/ChineseInputFix.log") or "ChineseInputFix.log"
+    if not dir then return "." end
+    return dir .. "/CowboyBingus/Helldivers2/Logs"
+end
+
+local function log_message(msg)
+    local path = data_dir() .. "/" .. LOG_NAME .. ".log"
     pcall(function()
         local f = io.open(path, "a")
         if f then
@@ -300,8 +319,9 @@ local function log_message(msg)
 end
 
 local function write_status(line)
-    local dir = os.getenv("LOCALAPPDATA")
-    local path = dir and (dir .. "/CowboyBingus/Helldivers2/Logs/ChineseInputFix_STATUS.txt") or "ChineseInputFix_STATUS.txt"
+    if line == M.last_status then return end
+    M.last_status = line
+    local path = data_dir() .. "/" .. LOG_NAME .. "_STATUS.txt"
     pcall(function()
         local f = io.open(path, "w")
         if f then
@@ -311,8 +331,361 @@ local function write_status(line)
     end)
 end
 
+local CONFIG_PATH = data_dir() .. "/" .. LOG_NAME .. ".ini"
+
+-- 打开输入框/注册菜单的每一步都留痕(各给有限次数, 稳态不写盘)。
+-- 真卡死时, 日志最后一行就是卡住的那一步。
+local trace_budget = 40
+local menu_trace_budget = 12
+
+local function trace(msg)
+    if trace_budget <= 0 then return end
+    trace_budget = trace_budget - 1
+    log_message("[trace] " .. msg)
+end
+
+local function trace_menu(msg)
+    if menu_trace_budget <= 0 then return end
+    menu_trace_budget = menu_trace_budget - 1
+    log_message("[trace] " .. msg)
+end
+
+-- 解析 ini 文本(纯函数, 供离线测试)
+local function parse_ini_text(text)
+    local result = {}
+    if type(text) ~= "string" then return result end
+    for line in text:gmatch("[^\r\n]+") do
+        local body = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if body ~= "" and body:sub(1, 1) ~= "#" and body:sub(1, 1) ~= ";" then
+            local key, value = body:match("^([%w_%-]+)%s*=%s*(.-)$")
+            if key then
+                result[key:lower()] = (value or ""):gsub("%s+$", "")
+            end
+        end
+    end
+    return result
+end
+
+local function load_config()
+    local raw
+    pcall(function()
+        local f = io.open(CONFIG_PATH, "r")
+        if f then
+            raw = f:read("*a")
+            f:close()
+        end
+    end)
+    if raw == nil then
+        -- 首次运行写一份带注释的模板, 方便玩家手改
+        pcall(function()
+            local f = io.open(CONFIG_PATH, "w")
+            if f then
+                f:write("# ChineseInputFix 配置（仅在没有安装「模组菜单」时生效）\n")
+                f:write("# 颜色: AARRGGBB, 例如 FFFF3B30 = 不透明红; 留空 = 不上色\n")
+                f:write("color =\n")
+                f:write("# 字号: 游戏 <s=xx> 的数值(有效范围 10-99), 0 = 不加字号标记\n")
+                f:write("size = 0\n")
+                f:write("# 可选: 追加在消息末尾的收尾标记(某些构建需要闭合颜色/字号标记才会复原)\n")
+                f:write("suffix =\n")
+                f:write("# 抢焦点的强度: 1 = 标准(默认), 0 = 只显示不抢焦点(遇到卡死时的应急值)\n")
+                f:write("focus = 1\n")
+                f:close()
+            end
+        end)
+        return {}
+    end
+    return parse_ini_text(raw)
+end
+
 -- -------------------------------------------------------------------------------------
--- Floating Input Box (Single-Line Proportions + Universal IME Support)
+-- 颜色 / 字号 (纯函数, 可离线测试)
+-- -------------------------------------------------------------------------------------
+local COLOR_PRESETS = {
+    {label = "红色", argb = "FFFF3B30"},
+    {label = "橙色", argb = "FFFF9500"},
+    {label = "黄色", argb = "FFFFD60A"},
+    {label = "绿色", argb = "FF30D158"},
+    {label = "青色", argb = "FF32D4E8"},
+    {label = "蓝色", argb = "FF0A84FF"},
+    {label = "紫色", argb = "FFBF5AF2"},
+    {label = "白色", argb = "FFFFFFFF"},
+    {label = "黑色", argb = "FF000000"},
+}
+
+local COLOR_CHOICES = {}
+COLOR_CHOICES[1] = "关闭"
+for i, preset in ipairs(COLOR_PRESETS) do
+    COLOR_CHOICES[i + 1] = preset.label
+end
+local CUSTOM_CHOICE = #COLOR_CHOICES + 1
+COLOR_CHOICES[CUSTOM_CHOICE] = "自定义"
+
+local function clamp_int(value, lo, hi)
+    local n = tonumber(value)
+    if not n then return lo end
+    n = math.floor(n + 0.5)
+    if n < lo then return lo end
+    if n > hi then return hi end
+    return n
+end
+
+local function valid_argb(hex)
+    return type(hex) == "string" and #hex == 8 and hex:match("^%x%x%x%x%x%x%x%x$") ~= nil
+end
+
+-- color_index: COLOR_CHOICES 的下标; custom_a/r/g/b: 0..255; size_raw: <s=xx>;
+-- fallback_hex: 无菜单时的 ini 颜色
+local function compute_style(color_index, custom_a, custom_r, custom_g, custom_b, size_raw, fallback_hex)
+    local argb, size = nil, nil
+
+    local idx = tonumber(color_index)
+    if idx and idx >= 1 and idx <= #COLOR_CHOICES then
+        if idx == 1 then
+            argb = nil
+        elseif idx == CUSTOM_CHOICE then
+            argb = string.format("%02X%02X%02X%02X",
+                clamp_int(custom_a, 0, 255), clamp_int(custom_r, 0, 255),
+                clamp_int(custom_g, 0, 255), clamp_int(custom_b, 0, 255))
+        else
+            argb = COLOR_PRESETS[idx - 1].argb
+        end
+    elseif valid_argb(fallback_hex) then
+        argb = string.upper(fallback_hex)
+    end
+
+    local n = tonumber(size_raw)
+    if n and n > 0 then
+        -- 游戏标记是 <s=xx>: 两位数字, 且实测有效下限 10 / 上限 99
+        size = clamp_int(n, 10, 99)
+    end
+
+    return argb, size
+end
+
+-- 生成最终注入聊天框的字符串
+local function build_markup(argb, size, text, suffix)
+    if text == nil then text = "" end
+    if text == "" then return "" end
+    local prefix = ""
+    if argb and argb ~= "" then
+        prefix = prefix .. "<c=" .. string.upper(argb) .. ">"
+    end
+    if size and tonumber(size) and tonumber(size) > 0 then
+        prefix = prefix .. "<s=" .. tostring(math.floor(tonumber(size))) .. ">"
+    end
+    if type(suffix) == "string" and suffix ~= "" then
+        return prefix .. text .. suffix
+    end
+    return prefix .. text
+end
+
+-- -------------------------------------------------------------------------------------
+-- 模组菜单接入 (CowboyBingus Mod Options Menu, api 1)
+--   约定: ModOptionsMenu.register_option(id, spec) / get(id) / on_change(id, fn)
+--   菜单可能在我们的 mod 之后加载, 所以按帧轮询全局变量, 找到后只注册一次。
+-- -------------------------------------------------------------------------------------
+-- 分类名优先用 ASCII: 菜单现有的分类全是英文, 先用同类名字注册最稳; 中文只作兜底。
+-- 选项标签本身仍然是中文。
+local MENU_MOD_NAMES = { "CHINESE INPUT FIX", "中文输入框" }
+local OPTION_PREFIX = "chinese_input_fix"
+
+local menu = {
+    state = "waiting",   -- waiting | ready | unavailable
+    entity = nil,
+    mod_name = nil,
+    registered = {},     -- key -> true
+    values = {},         -- key -> 菜单当前值
+    next_frame = 0,
+    warned = false,
+    attempts = 0,
+}
+
+-- 说明: 菜单/游戏字体里没有「」这类全角引号, 会显示成问号, 所以这里只用常见字符。
+local function option_specs()
+    return {
+        {key = "color", id = OPTION_PREFIX .. ".color", type = "choice",
+         label = "文字颜色", choices = COLOR_CHOICES, default = 1,
+         description = "聊天文字颜色, 写进消息里的格式是 <c=AARRGGBB>; 选自定义时用下面 4 个滑块"},
+        {key = "alpha", id = OPTION_PREFIX .. ".alpha", type = "slider",
+         label = "自定义 透明度A", min = 0, max = 255, step = 1, default = 255,
+         description = "自定义颜色的透明度(AA), 255 = 完全不透明"},
+        {key = "red", id = OPTION_PREFIX .. ".red", type = "slider",
+         label = "自定义 红R", min = 0, max = 255, step = 1, default = 255,
+         description = "自定义颜色的红色分量"},
+        {key = "green", id = OPTION_PREFIX .. ".green", type = "slider",
+         label = "自定义 绿G", min = 0, max = 255, step = 1, default = 255,
+         description = "自定义颜色的绿色分量"},
+        {key = "blue", id = OPTION_PREFIX .. ".blue", type = "slider",
+         label = "自定义 蓝B", min = 0, max = 255, step = 1, default = 255,
+         description = "自定义颜色的蓝色分量"},
+        {key = "size_on", id = OPTION_PREFIX .. ".size_on", type = "toggle",
+         label = "启用字号", default = false,
+         description = "打开后才会在消息里加字号标记; 关闭时用游戏默认字号"},
+        {key = "size", id = OPTION_PREFIX .. ".size", type = "slider",
+         label = "字号", min = 10, max = 99, step = 1, default = 10,
+         description = "游戏 <s=xx> 的字号, 有效范围 10-99"},
+    }
+end
+
+local function menu_register(page, mod_name)
+    local any = false
+    for _, spec in ipairs(option_specs()) do
+        local body = {
+            type = spec.type,
+            label = spec.label,
+            mod = mod_name,
+            description = spec.description,
+            default = spec.default,
+            gap = spec.gap,
+            choices = spec.choices,
+            min = spec.min,
+            max = spec.max,
+            step = spec.step,
+        }
+        local ok, registered, why = pcall(function()
+            trace_menu("menu.register " .. spec.id)
+            return page.register_option(spec.id, body)
+        end)
+        if ok and registered then
+            any = true
+            trace_menu("menu.registered " .. spec.id)
+            menu.registered[spec.key] = true
+            local got, value = pcall(function() return page.get(spec.id) end)
+            if got and value ~= nil then
+                menu.values[spec.key] = value
+            end
+            pcall(function()
+                page.on_change(spec.id, function(new_value)
+                    menu.values[spec.key] = new_value
+                end)
+            end)
+        else
+            log_message(string.format("模组菜单拒绝了选项 %s: %s", spec.id, tostring(why or registered)))
+        end
+    end
+    return any
+end
+
+-- 每帧调用; 内部自带节流, 未注册成功前按帧数轮询
+local MAX_REGISTER_ATTEMPTS = 12
+
+local function menu_poll(frame)
+    if menu.state == "ready" then return end
+    if frame < menu.next_frame then return end
+    -- 头 1.5 秒不碰菜单: 让游戏先把 MODS 标签搭好, 避免抢在它初始化中间注册
+    if menu.entity == nil and menu.attempts == 0 and frame < 90 then
+        menu.next_frame = frame + 30
+        return
+    end
+    -- 还没见过菜单时每 30 帧找一次; 见过但没注册成功就放慢重试
+    local step = 30
+    if menu.state ~= "waiting" then
+        step = 300
+    elseif menu.attempts > 0 then
+        step = 120
+    end
+    menu.next_frame = frame + step
+
+    local page = rawget(_G, "ModOptionsMenu")
+    if page == nil then
+        if menu.state == "waiting" and not menu.warned and frame > 1800 then
+            menu.warned = true
+            log_message("未检测到「模组菜单」(ModOptionsMenu), 使用 ChineseInputFix.ini 或默认设置")
+        end
+        return
+    end
+
+    if type(page) ~= "table" or page.api ~= 1 or type(page.register_option) ~= "function" then
+        if not menu.warned then
+            menu.warned = true
+            log_message("「模组菜单」api 不兼容(需要 api 1), 使用 ini 或默认设置")
+        end
+        menu.state = "unavailable"
+        return
+    end
+
+    if menu.entity ~= page then
+        menu.entity = page
+        menu.attempts = 0
+        menu.registered = {}
+    end
+
+    -- 菜单可能刚出现还没准备好: 失败就过一会儿再试, 但不无限重试
+    menu.attempts = menu.attempts + 1
+    for _, mod_name in ipairs(MENU_MOD_NAMES) do
+        if menu_register(page, mod_name) then
+            menu.state = "ready"
+            menu.mod_name = mod_name
+            log_message("已注册到「模组菜单」: " .. mod_name)
+            return
+        end
+    end
+    if menu.attempts >= MAX_REGISTER_ATTEMPTS then
+        menu.state = "unavailable"
+        log_message("模组菜单注册失败(已重试 " .. tostring(menu.attempts) .. " 次), 使用 ini 或默认设置")
+    end
+end
+
+local function menu_value(key)
+    if not menu.registered[key] then return nil end
+    return menu.values[key]
+end
+
+-- -------------------------------------------------------------------------------------
+-- 当前样式
+-- -------------------------------------------------------------------------------------
+local config = {}
+
+-- 字号的取值来源: 菜单开关 > 菜单滑块 > ini。开关关掉就是"不加标记", 连 ini 也不看
+-- (否则玩家在菜单里关掉字号, ini 里的旧值又把它顶开了)。
+local function size_input()
+    if menu.registered.size_on then
+        if menu.values.size_on == true then
+            return menu.values.size
+        end
+        return nil
+    end
+    if menu.registered.size then
+        return menu.values.size      -- 菜单只注册了滑块: 沿用 >0 即启用的旧语义
+    end
+    return config.size               -- 完全没有菜单: 读 ini
+end
+
+local function resolve_style()
+    local color_index = menu_value("color")
+    local custom_a = menu_value("alpha")
+    local custom_r = menu_value("red")
+    local custom_g = menu_value("green")
+    local custom_b = menu_value("blue")
+    local size_raw = size_input()
+
+    if color_index == nil then
+        -- 没有菜单: ini 里的 color 直接当十六进制用
+        return compute_style(nil, nil, nil, nil, nil, size_raw, config.color)
+    end
+    return compute_style(color_index, custom_a, custom_r, custom_g, custom_b,
+        size_raw, config.color)
+end
+
+local function decorate(text)
+    local argb, size = resolve_style()
+    return build_markup(argb, size, text, config.suffix)
+end
+
+local function style_summary()
+    local argb, size = resolve_style()
+    local label = argb and ("颜色 " .. argb) or "颜色 关闭"
+    if size then label = label .. " / 字号 " .. tostring(size) else label = label .. " / 字号 关闭" end
+    if menu.state == "ready" then
+        label = label .. " (菜单已接入)"
+    else
+        label = label .. " (无菜单)"
+    end
+    return label
+end
+
+-- -------------------------------------------------------------------------------------
+-- 浮动输入框 (单行比例 + 全输入法支持)
 -- -------------------------------------------------------------------------------------
 local box = {
     hwnd = nil,
@@ -321,19 +694,38 @@ local box = {
     font = nil,
     brush = nil,
     himc = nil,
+    saved_text = "",   -- 失焦时暂存的输入内容
 }
 
+-- 句柄一律按 64 位整数原样传递/比较。
+-- 千万别 tonumber(): HFONT/HBRUSH/HIMC 是 32 位值符号扩展成 64 位的, 形如 0xFFFFFFFFxxxxxxxx,
+-- 转成 double 会丢掉低位, 传出去就是个错句柄 —— 字体偶发变成"系统默认小字"就是这么来的。
+local function handle_value(value)
+    if value == nil then return ffi.cast("uint64_t", 0) end
+    return ffi.cast("uint64_t", ffi.cast("uintptr_t", value))
+end
+
+local function is_null(value)
+    if value == nil then return true end
+    return handle_value(value) == ffi.cast("uint64_t", 0)
+end
+
+local function handles_equal(a, b)
+    if a == nil or b == nil then return a == b end
+    return handle_value(a) == handle_value(b)
+end
+
 local function is_ime_composing()
-    if not box.hwnd or not native.imm32 then return false end
+    if is_null(box.hwnd) or not native.imm32 then return false end
     local himc = native.imm32.hd2_ImmGetContext(box.hwnd)
-    if himc == nil then return false end
+    if is_null(himc) then return false end
     local len = native.imm32.hd2_ImmGetCompositionStringW(himc, 0x0008, nil, 0)
     native.imm32.hd2_ImmReleaseContext(box.hwnd, himc)
     return len > 0
 end
 
 local function get_box_text()
-    if not box.hwnd then return "" end
+    if is_null(box.hwnd) then return "" end
     local len = native.user32.hd2_GetWindowTextLengthW(box.hwnd)
     if len <= 0 then return "" end
     local buf = ffi.new("wchar_t[?]", len + 1)
@@ -341,21 +733,99 @@ local function get_box_text()
     return to_utf8(buf, len)
 end
 
+local function set_box_text(text)
+    if is_null(box.hwnd) then return end
+    local body = text or ""
+    native.user32.hd2_SetWindowTextW(box.hwnd, to_wide(body))
+    if body ~= "" then
+        -- 恢复内容后把插入点放到末尾: EM_SETSEL(-1, -1) 取消选择并把 caret 移到结尾
+        native.user32.hd2_SendMessageW(box.hwnd, 0x00B1, ffi.cast("uint64_t", -1),
+            ffi.cast("int64_t", -1))
+    end
+end
+
 local function clear_box_text()
-    if box.hwnd then
-        native.user32.hd2_SetWindowTextW(box.hwnd, to_wide(""))
+    set_box_text("")
+end
+
+-- 句柄一律按 64 位整数原样传递/比较。
+-- 千万别 tonumber(): HFONT/HBRUSH/HIMC 是 32 位值符号扩展成 64 位的, 形如 0xFFFFFFFFxxxxxxxx,
+-- 转成 double 会丢掉低位, 传出去就是个错句柄 —— 字体偶发变成"系统默认小字"就是这么来的。
+-- (helper 定义在 box 声明之后, 这里只留说明)
+
+local function same_window(a, b)
+    if a == nil or b == nil then return false end
+    return handles_equal(a, b)
+end
+
+-- -------------------------------------------------------------------------------------
+-- 输入框字体: 建立后必须回读确认真的挂上了
+--   症状: 偶发"输入框里的字变得很小" —— 就是 WM_SETFONT 收到一个被截断的 HFONT,
+--   控件 SelectObject 失败后回落到系统默认字体(约 9pt)。
+-- -------------------------------------------------------------------------------------
+local WM_SETFONT = 0x0030
+local WM_GETFONT = 0x0031
+local BOX_FONT_HEIGHT = -28          -- 负值 = 字符高度 28 像素
+
+local function box_font_attached()
+    if is_null(box.hwnd) or is_null(box.font) then return false end
+    local current = native.user32.hd2_SendMessageW(box.hwnd, WM_GETFONT,
+        ffi.cast("uint64_t", 0), ffi.cast("int64_t", 0))
+    return handles_equal(current, box.font)
+end
+
+local function apply_box_font()
+    if is_null(box.hwnd) or not native.gdi32 then return false end
+
+    if is_null(box.font) then
+        box.font = native.gdi32.hd2_CreateFontW(
+            BOX_FONT_HEIGHT, 0, 0, 0, 500,
+            0, 0, 0, 1, 0, 0, 5,
+            0, to_wide("Microsoft YaHei UI"))
+        if is_null(box.font) then
+            log_message("CreateFontW 失败: 输入框会显示成系统默认小字")
+            return false
+        end
+    end
+
+    if box_font_attached() then return true end
+
+    -- 句柄按 64 位原样传(见 handle_value 的注释), 不能 tonumber
+    native.user32.hd2_SendMessageW(box.hwnd, WM_SETFONT, handle_value(box.font),
+        ffi.cast("int64_t", 1))
+
+    if not box_font_attached() then
+        log_message("WM_SETFONT 未生效(字体句柄无效): 输入框会显示成系统默认小字")
+        return false
+    end
+    return true
+end
+
+-- 把焦点交给输入框。
+-- 注意: 这里绝对不能 AttachThreadInput —— 主线程正卡在 Lua 里, 挂接另一个线程的输入队列
+-- 会当场死锁(实测表现为"一开输入框游戏就卡死")。只做 v3.11 已验证过的那三件事。
+-- config.focus: 0 = 只显示不抢焦点(应急), 1 = 标准, 2 = 标准 + 显式 SetFocus
+local function focus_box(hwnd)
+    if hwnd == nil then return end
+    local u = native.user32
+    if u.hd2_IsWindow(hwnd) == 0 then return end
+    local mode = tonumber(config.focus) or 1
+    if mode <= 0 then return end
+    u.hd2_BringWindowToTop(hwnd)
+    u.hd2_SetForegroundWindow(hwnd)
+    if mode >= 2 then
+        u.hd2_SetFocus(hwnd)
     end
 end
 
 local function create_input_box()
-    if box.created and box.hwnd ~= nil then return true end
+    if box.created and not is_null(box.hwnd) then return true end
 
     local u = native.user32
     local class_edit = to_wide("EDIT")
     local title = to_wide("")
 
-    -- Proportions: Strict single-line aesthetic
-    -- Width: 960px, Height: 48px, Font: -28px (Fills box proportionally with no empty vertical waste)
+    -- 严格单行比例: 宽 960 / 高 48 / 字号 -28
     local screen_w = u.hd2_GetSystemMetrics(0)
     local screen_h = u.hd2_GetSystemMetrics(1)
     local box_w = 960
@@ -363,7 +833,6 @@ local function create_input_box()
     local box_x = math.floor((screen_w - box_w) / 2)
     local box_y = screen_h - 160 - box_h
 
-    -- Pure single-line control: ES_AUTOHSCROLL | ES_LEFT
     local WS_POPUP = 0x80000000
     local ES_AUTOHSCROLL = 0x0080
     local ES_LEFT = 0x0000
@@ -380,28 +849,26 @@ local function create_input_box()
         nil, nil, nil, nil
     )
 
-    if box.hwnd == nil then
-        log_message("Failed to create styled input box")
+    if is_null(box.hwnd) then
+        log_message("创建浮动输入框失败")
         return false
     end
 
-    -- Universal IME Binding: Explicitly attach and activate an IME Context on this edit HWND
-    -- This guarantees Sogou, Wechat IME, Baidu, QQ etc. recognize the focus target as an active IME window!
+    -- 显式绑定一个 IME 上下文, 让搜狗/微信/百度/QQ 输入法都认这个控件
     if native.imm32 then
         pcall(function()
             local imm = native.imm32
             box.himc = imm.hd2_ImmCreateContext()
-            if box.himc ~= nil then
+            if not is_null(box.himc) then
                 imm.hd2_ImmAssociateContext(box.hwnd, box.himc)
-                imm.hd2_ImmSetOpenStatus(box.himc, 1) -- Keep IME open for typing
+                imm.hd2_ImmSetOpenStatus(box.himc, 1)
             end
         end)
     end
 
-    -- Sleek sheer glass: alpha 125
+    -- 轻薄黑色毛玻璃: alpha 125
     u.hd2_SetLayeredWindowAttributes(box.hwnd, 0, 125, 2) -- LWA_ALPHA = 2
 
-    -- Subtle dark acrylic blur
     pcall(function()
         local policy = ffi.new("ACCENT_POLICY[1]")
         policy[0].AccentState = 4 -- ACCENT_ENABLE_ACRYLICBLURBEHIND
@@ -416,24 +883,13 @@ local function create_input_box()
         u.hd2_SetWindowCompositionAttribute(box.hwnd, data)
     end)
 
-    -- Dark brush & Proportionate font (-28 height, bold 500)
     if native.gdi32 then
         local bg_color = bit.bor(0x14, bit.lshift(0x14, 8), bit.lshift(0x1E, 16))
         box.brush = native.gdi32.hd2_CreateSolidBrush(bg_color)
-
-        local font_name = to_wide("Microsoft YaHei UI")
-        box.font = native.gdi32.hd2_CreateFontW(
-            -28, 0, 0, 0, 500,
-            0, 0, 0, 1, 0, 0, 5,
-            0, font_name
-        )
-        if box.font ~= nil then
-            local WM_SETFONT = 0x0030
-            u.hd2_SendMessageW(box.hwnd, WM_SETFONT, tonumber(ffi.cast("uintptr_t", box.font)), 1)
-        end
     end
 
-    -- Comfortable margins: 16px horizontal padding
+    apply_box_font()
+
     local EC_LEFTMARGIN = 0x0001
     local EC_RIGHTMARGIN = 0x0002
     local margins = bit.bor(16, bit.lshift(16, 16))
@@ -441,36 +897,63 @@ local function create_input_box()
 
     box.created = true
     u.hd2_ShowWindow(box.hwnd, 0) -- SW_HIDE
-    log_message(string.format("Created single-line input box hwnd: 0x%x (48px height, font -28)",
-        tonumber(ffi.cast("uintptr_t", box.hwnd))))
+    log_message("已创建浮动输入框 " .. tostring(box.hwnd)
+        .. " (960x48, 字体高度 " .. tostring(BOX_FONT_HEIGHT) .. ")")
     return true
 end
 
-local function show_input_box()
+-- 打开输入框的每一步都留痕(前若干次), 万一还卡死, 日志最后一行就是卡住的位置
+-- restore_text = true 时把失焦前暂存的内容填回去
+local function show_input_box(restore_text)
+    trace("show.begin restore=" .. tostring(restore_text) .. " saved=" .. tostring(#box.saved_text))
     if not box.created and not create_input_box() then return end
-    clear_box_text()
-    native.user32.hd2_ShowWindow(box.hwnd, 5) -- SW_SHOW
-    native.user32.hd2_BringWindowToTop(box.hwnd)
-    native.user32.hd2_SetForegroundWindow(box.hwnd)
-    native.user32.hd2_SetFocus(box.hwnd)
+    local u = native.user32
+    if restore_text and box.saved_text ~= "" then
+        set_box_text(box.saved_text)
+    else
+        clear_box_text()
+    end
+    trace("show.text-ok")
+    box.saved_text = ""
+    -- 每次弹出都回读一次字体: 万一被系统/DPI 变化重置, 这里会重新挂回去
+    apply_box_font()
+    u.hd2_ShowWindow(box.hwnd, 5) -- SW_SHOW
+    trace("show.showwindow-ok")
+    focus_box(box.hwnd)
+    trace("show.focus-ok")
     if native.imm32 and box.himc then
         native.imm32.hd2_ImmSetOpenStatus(box.himc, 1)
+        trace("show.ime-ok")
     end
     box.visible = true
+    trace("show.done")
 end
 
 local function hide_input_box()
     if box.hwnd and box.visible then
+        trace("hide.begin")
         native.user32.hd2_ShowWindow(box.hwnd, 0) -- SW_HIDE
         box.visible = false
+        trace("hide.done")
     end
 end
 
--- Foreground window check for Alt-Tab auto-hide
+-- 失焦隐藏: 先记住内容, 不销毁、不清空
+local function suspend_input_box()
+    if box.hwnd and box.visible then
+        box.saved_text = get_box_text()
+        trace("suspend.saved=" .. tostring(#box.saved_text))
+        native.user32.hd2_ShowWindow(box.hwnd, 0) -- SW_HIDE
+        box.visible = false
+        M.suspended = true
+        trace("suspend.done")
+    end
+end
+
 local function is_game_or_box_foreground()
     local fg = native.user32.hd2_GetForegroundWindow()
-    if fg == nil then return false end
-    if fg == box.hwnd then return true end
+    if is_null(fg) then return false end
+    if same_window(fg, box.hwnd) then return true end
 
     local pid = ffi.new("uint32_t[1]")
     native.user32.hd2_GetWindowThreadProcessId(fg, pid)
@@ -478,7 +961,7 @@ local function is_game_or_box_foreground()
 end
 
 -- -------------------------------------------------------------------------------------
--- Chat State & Ingestion
+-- 聊天状态与提交
 -- -------------------------------------------------------------------------------------
 local function chat_widget()
     local hud = pointer(read(native.base + V.hud, 8))
@@ -492,22 +975,23 @@ end
 
 local function send_text_to_chat(text)
     local widget = chat_widget()
-    if not widget or not is_chat_open(widget) then return end
+    if not widget or not is_chat_open(widget) then
+        log_message("聊天框已关闭, 放弃注入")
+        return
+    end
 
     local field = widget + V.chat_field
     local text_widget = field + V.field_widget
 
-    -- Clean native set_text call
     fn.set_text(text_widget, text or "")
-    log_message(string.format("Injected chat text: '%s'", text or ""))
+    log_message(string.format("注入聊天文本: '%s'", text or ""))
 
-    -- Verified game submit keybd_event
     local KEYEVENTF_KEYUP = 0x0002
     native.user32.hd2_keybd_event(0x0D, 0x1C, 0, 0)
     native.user32.hd2_keybd_event(0x0D, 0x1C, KEYEVENTF_KEYUP, 0)
 end
 
--- Thread-wide message pump (hwnd = nil) so candidate windows of Sogou/WeChat IME receive messages
+-- 线程级消息泵: hwnd 传 nil, 第三方输入法的候选窗也能收到消息
 local function pump_box_messages()
     if not box.visible or not box.hwnd then return end
     local msg = ffi.new("MSG[1]")
@@ -515,12 +999,11 @@ local function pump_box_messages()
     local g = native.gdi32
     local count = 0
 
-    -- Passing nil to PeekMessageW processes messages for both edit box AND IME candidate popup windows!
     while u.hd2_PeekMessageW(msg, nil, 0, 0, 1) ~= 0 do -- PM_REMOVE = 1
         local m = msg[0].message
         local w = msg[0].wParam
 
-        -- Drop Enter (13) and Escape (27) to eliminate Windows 'Ding' sound on single-line edit
+        -- 丢弃 Enter(13)/Esc(27) 的 WM_CHAR, 消除单行框的 Windows "叮" 声
         local drop = false
         if msg[0].hwnd == box.hwnd and m == 0x0102 and (w == 13 or w == 10 or w == 27) then
             drop = true
@@ -545,34 +1028,65 @@ local function pump_box_messages()
 end
 
 -- -------------------------------------------------------------------------------------
--- Frame Update Controller
+-- 每帧更新
 -- -------------------------------------------------------------------------------------
+-- 纯状态机: 根据当前观测决定这一帧要做什么(便于离线测试)
+--   suspend         失焦 → 记下内容后隐藏(关键: 不清空)
+--   show_restore    重新获得焦点且聊天仍开着 → 显示并恢复内容
+--   show_fresh      刚打开聊天 → 显示空输入条
+--   hide_discard    聊天被关掉 → 隐藏并丢弃内容
+--   clear_suspended 聊天已关但还留着挂起内容 → 清掉
+--   none            什么都不做
+local function decide(visible, focused, chat_open, suspended, cooled)
+    if visible and not focused then return "suspend" end
+    if chat_open and not visible and focused and cooled then
+        if suspended then return "show_restore" end
+        return "show_fresh"
+    end
+    if visible and not chat_open then return "hide_discard" end
+    if not visible and not chat_open and suspended then return "clear_suspended" end
+    return "none"
+end
+
 local function tick(dt)
+    M.frames = M.frames + 1
+
+    -- 菜单只轮询全局变量, 开销可忽略
+    menu_poll(M.frames)
+
+    -- 样式变化时刷新一次 STATUS(稳态不写盘)
+    if M.frames % 120 == 0 then
+        write_status(string.format("OK - %s | %s", MOD_VERSION, style_summary()))
+    end
+
     local widget = chat_widget()
     local chat_open = is_chat_open(widget)
     local now = os.clock()
+    local focused = is_game_or_box_foreground()
 
-    -- 1. Auto-hide quietly if player Alt-Tabs away
-    if box.visible and not is_game_or_box_foreground() then
-        hide_input_box()
-        M.was_chat_open = false
+    local action = decide(box.visible, focused, chat_open, M.suspended, now >= M.cooldown_until)
+
+    if action == "suspend" then
+        log_message("失去焦点, 已暂存输入内容并隐藏输入条")
+        suspend_input_box()
         return
-    end
-
-    -- 2. Check if user just opened chat in-game (instant show)
-    if chat_open and not M.was_chat_open and now >= M.cooldown_until then
-        if is_game_or_box_foreground() then
-            M.was_chat_open = true
-            show_input_box()
-        end
-    elseif not chat_open and M.was_chat_open then
-        M.was_chat_open = false
+    elseif action == "show_restore" then
+        M.suspended = false
+        log_message("重新获得焦点, 已恢复未发送的输入内容")
+        show_input_box(true)
+    elseif action == "show_fresh" then
+        show_input_box(false)
+    elseif action == "hide_discard" then
         hide_input_box()
+        box.saved_text = ""
+        M.suspended = false
+    elseif action == "clear_suspended" then
+        box.saved_text = ""
+        M.suspended = false
     end
 
     if not box.visible then return end
 
-    -- Thread-wide zero-delay message pump for all IME candidates
     pump_box_messages()
 
     local u = native.user32
@@ -586,29 +1100,38 @@ local function tick(dt)
 
     local composing = is_ime_composing()
 
-    -- Only send or cancel when IME candidate window is NOT in composition
-    if not composing then
-        if enter_hit then
-            local text = get_box_text()
-            hide_input_box()
-            M.cooldown_until = now + 0.35
-            send_text_to_chat(text)
-        elseif esc_hit then
-            hide_input_box()
-            M.cooldown_until = now + 0.25
-            send_text_to_chat("")
-        end
+    -- 输入法正在选字时, Enter 只用于上屏, 不触发发送
+    if composing then return end
+
+    if enter_hit then
+        local text = get_box_text()
+        local payload = decorate(text)
+        hide_input_box()
+        clear_box_text()
+        box.saved_text = ""
+        M.suspended = false
+        M.cooldown_until = now + 0.35
+        send_text_to_chat(payload)
+    elseif esc_hit then
+        hide_input_box()
+        clear_box_text()
+        box.saved_text = ""
+        M.suspended = false
+        M.cooldown_until = now + 0.25
+        send_text_to_chat("")
     end
 end
 
 -- -------------------------------------------------------------------------------------
--- Mod Entry & Hook
+-- Mod Entry
 -- -------------------------------------------------------------------------------------
 local function start()
     M.started = true
+
     local ok_nat, why_nat = init_native()
     if not ok_nat then
         write_status("NOT AVAILABLE - " .. why_nat)
+        log_message("初始化失败: " .. tostring(why_nat))
         M.retired = true
         return
     end
@@ -616,28 +1139,40 @@ local function start()
     local ok_res, why_res = resolve_sigs()
     if not ok_res then
         write_status("NOT AVAILABLE - " .. why_res)
+        log_message("特征码校验失败: " .. tostring(why_res))
         M.retired = true
         return
     end
 
+    config = load_config()
     create_input_box()
+
     M.ready = true
-    log_message("ChineseInputFix v3.11.0 (Universal IME & Single Line) loaded successfully")
-    write_status("OK - ChineseInputFix active (Universal IME & Single Line)")
+    log_message(string.format("ChineseInputFix v%s 已加载", MOD_VERSION))
+    write_status(string.format("OK - %s | %s", MOD_VERSION, style_summary()))
 end
 
 local original_update = rawget(_G, "update")
-update = function(dt, ...)
+local my_update
+my_update = function(dt, ...)
     if not M.retired then
         if not M.started then
-            start()
+            local ok, err = pcall(start)
+            if not ok then
+                M.retired = true
+                write_status("STOPPED - 启动异常: " .. tostring(err))
+                log_message("启动异常: " .. tostring(err))
+            end
         elseif M.ready then
-            local ok_step, err = pcall(tick, dt)
-            if not ok_step then
+            local ok, err = pcall(tick, dt)
+            if not ok then
                 M.errors = M.errors + 1
+                if M.errors <= 3 then
+                    log_message("tick 异常: " .. tostring(err))
+                end
                 if M.errors >= 10 then
                     M.retired = true
-                    write_status("STOPPED - repeated errors: " .. tostring(err))
+                    write_status("STOPPED - 重复异常: " .. tostring(err))
                 end
             end
         end
@@ -647,8 +1182,34 @@ update = function(dt, ...)
         return original_update(dt, ...)
     end
 end
+update = my_update
+
+-- 安全退钩: 仅当自己仍是顶层包装者时才还原, 避免截断后续 mod 的 update 链
+M.retire_hook = function()
+    M.retired = true
+    if update == my_update then
+        update = original_update
+    end
+end
 
 return {
     installed = true,
-    version = M.version,
+    version = MOD_VERSION,
+    -- 供离线测试的纯函数与状态
+    _test = {
+        build_markup = build_markup,
+        compute_style = compute_style,
+        parse_ini_text = parse_ini_text,
+        color_choices = COLOR_CHOICES,
+        color_presets = COLOR_PRESETS,
+        custom_choice = CUSTOM_CHOICE,
+        decorate = decorate,
+        resolve_style = resolve_style,
+        decide = decide,
+        poll_menu = menu_poll,
+        menu = menu,
+        option_specs = option_specs,
+        set_config = function(values) config = values or {} end,
+        set_frames = function(n) M.frames = n end,
+    },
 }

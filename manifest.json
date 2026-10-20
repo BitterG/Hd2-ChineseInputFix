@@ -2,11 +2,11 @@
   "Version": 1,
   "Guid": "8a01dc3d-e467-5774-af49-9b426c42f828",
   "Name": "ChineseInputFix",
-  "Description": "Needs Bingus Shared Loader v15 or newer with addon support enabled. Nothing else is required: 'API 1' is the loader's own Lua API level (printed in BingusSharedLoader.log), not a separate mod.",
+  "Description": "v3.15.1  游戏内中文输入框(黑色毛玻璃, 支持微软/搜狗/微信/百度/QQ 等输入法), 可给聊天文字上色与调字号(<c=AARRGGBB> / <s=xx>, 字号 10-99)。需要 Bingus Shared Loader v15+ (addon 支持已开启)。可选: CowboyBingus Mod Options Menu v1 (api 1) 提供游戏内设置页; 未安装时读取 %LOCALAPPDATA%\\CowboyBingus\\Helldivers2\\Logs\\ChineseInputFix.ini。",
   "Options": [
     {
       "Name": "ChineseInputFix",
-      "Description": "Needs Bingus Shared Loader v15 or newer with addon support enabled. Nothing else is required: 'API 1' is the loader's own Lua API level (printed in BingusSharedLoader.log), not a separate mod.",
+      "Description": "v3.15.1  游戏内中文输入框(黑色毛玻璃, 支持微软/搜狗/微信/百度/QQ 等输入法), 可给聊天文字上色与调字号(<c=AARRGGBB> / <s=xx>, 字号 10-99)。需要 Bingus Shared Loader v15+ (addon 支持已开启)。可选: CowboyBingus Mod Options Menu v1 (api 1) 提供游戏内设置页; 未安装时读取 %LOCALAPPDATA%\\CowboyBingus\\Helldivers2\\Logs\\ChineseInputFix.ini。",
       "Include": [
         "Addon"
       ]
